@@ -39,22 +39,15 @@ function App() {
   const [directions, setDirections] = useState(null);
   const [bestDirections, setBestDirections] = useState(null);
 
-  const [currentPrice, setCurrentPrice] = useState(3.65);
+  const [fuelDistanceLeft, setFuelDistanceLeft] = useState(120);
   const [gallonsNeeded, setGallonsNeeded] = useState(10);
   const [mpg] = useState(25);
-  const [tankSize] = useState(14);
-  const [fuelPercent] = useState(40);
   const [timeValue, setTimeValue] = useState(15);
-  const [routeRadiusMiles] = useState(3);
 
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState("");
   const [selectedStation, setSelectedStation] = useState(null);
   const [recentTrips, setRecentTrips] = useState([]);
-
-  const currentRangeMiles = useMemo(() => {
-    return (tankSize * (fuelPercent / 100) * mpg).toFixed(1);
-  }, [tankSize, fuelPercent, mpg]);
 
   useEffect(() => {
     const savedTrips =
@@ -67,7 +60,7 @@ function App() {
     if (savedInputs) {
       setOrigin(savedInputs.origin || "Purdue University");
       setDestination(savedInputs.destination || "Chicago");
-      setCurrentPrice(savedInputs.currentPrice || 3.65);
+      setFuelDistanceLeft(savedInputs.fuelDistanceLeft || 120);
       setGallonsNeeded(savedInputs.gallonsNeeded || 10);
       setTimeValue(savedInputs.timeValue || 15);
     }
@@ -77,13 +70,13 @@ function App() {
     const inputs = {
       origin,
       destination,
-      currentPrice,
+      fuelDistanceLeft,
       gallonsNeeded,
       timeValue,
     };
 
     localStorage.setItem("smartpump_inputs", JSON.stringify(inputs));
-  }, [origin, destination, currentPrice, gallonsNeeded, timeValue]);
+  }, [origin, destination, fuelDistanceLeft, gallonsNeeded, timeValue]);
 
   const onMapLoad = (map) => {
     mapRef.current = map;
@@ -368,20 +361,16 @@ function App() {
   };
 
   const fetchGasPrices = async (lat, lng) => {
-    console.log("FETCH HERE START:", lat, lng, HERE_KEY);
     try {
       const url = `https://fuel-v2.cc.api.here.com/fuel/stations.json?prox=${lat},${lng},5000&apiKey=${HERE_KEY}`;
-      
-      console.log("HERE URL:", url);
-      console.log("HERE KEY:", HERE_KEY);
-      
+
       const response = await fetch(url);
       const data = await response.json();
 
-      console.log("HERE RAW DATA:", JSON.stringify(data, null, 2));
-
-      if (!response.ok || !data || !data.stations) {
-        console.warn("HERE returned no usable fuel data. Falling back to Google Places.");
+      if (!response.ok || !data || !Array.isArray(data.items)) {
+        console.warn(
+          "HERE returned no usable fuel data. Falling back to Google Places."
+        );
         return await fetchGooglePlacesGasStations(lat, lng);
       }
 
@@ -544,6 +533,7 @@ function App() {
   };
 
   const getSmartLabel = (station, allStations) => {
+    if (!station.canReachStation) return "Out of Range";
     if (!station.price) return "Closest Option";
 
     const highestSavings = Math.max(...allStations.map((s) => s.netSavings));
@@ -553,6 +543,16 @@ function App() {
     if (station.extraMinutes === leastDetour) return "Fastest Stop";
     if (station.distanceFromRoute <= 1) return "Easy Detour";
     return "Smart Pick";
+  };
+
+  const getAverageKnownPrice = (stationList) => {
+    const prices = stationList
+      .map((station) => station.price)
+      .filter((price) => price && Number.isFinite(price));
+
+    if (!prices.length) return null;
+
+    return prices.reduce((sum, price) => sum + price, 0) / prices.length;
   };
 
   const analyzeStationsWithRealDetour = async (rawStations) => {
@@ -571,7 +571,7 @@ function App() {
       .sort((a, b) => a.distanceFromRoute - b.distanceFromRoute)
       .slice(0, 10);
 
-    const analyzedResults = await Promise.allSettled(
+    const routeResults = await Promise.allSettled(
       routeFilteredStations.map(async (station) => {
         const routeWithStation = await getRouteWithStation(station);
         if (!routeWithStation) return null;
@@ -586,36 +586,51 @@ function App() {
           routeWithStation.totalDistanceMiles - original.distanceMiles
         );
 
-        const priceSavings = station.price
-          ? Math.max(0, currentPrice - station.price) * gallonsNeeded
-          : 0;
-
-        const extraFuelCost = station.price
-          ? (extraDistance / mpg) * station.price
-          : 0;
-
-        const timeCost = (extraMinutes / 60) * timeValue;
-        const netSavings = priceSavings - extraFuelCost - timeCost;
+        const canReachStation =
+          routeWithStation.milesToStation <= Number(fuelDistanceLeft);
 
         return {
           ...station,
           routeResult: routeWithStation.result,
           extraMinutes,
           extraDistance,
-          priceSavings,
-          extraFuelCost,
-          timeCost,
-          netSavings,
-          canReachStation: true,
+          canReachStation,
           milesToStation: routeWithStation.milesToStation,
         };
       })
     );
 
-    const analyzed = analyzedResults
+    const reachableStations = routeResults
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value)
       .filter(Boolean)
+      .filter((station) => station.canReachStation);
+
+    const averagePrice = getAverageKnownPrice(reachableStations);
+
+    const analyzed = reachableStations
+      .map((station) => {
+        const priceSavings =
+          station.price && averagePrice
+            ? Math.max(0, averagePrice - station.price) * gallonsNeeded
+            : 0;
+
+        const extraFuelCost = station.price
+          ? (station.extraDistance / mpg) * station.price
+          : 0;
+
+        const timeCost = (station.extraMinutes / 60) * timeValue;
+        const netSavings = priceSavings - extraFuelCost - timeCost;
+
+        return {
+          ...station,
+          averagePrice,
+          priceSavings,
+          extraFuelCost,
+          timeCost,
+          netSavings,
+        };
+      })
       .sort((a, b) => b.netSavings - a.netSavings);
 
     return analyzed.map((station) => ({
@@ -627,6 +642,11 @@ function App() {
   const searchStations = async () => {
     if (!directions) {
       alert("Please calculate route first.");
+      return;
+    }
+
+    if (!fuelDistanceLeft || Number(fuelDistanceLeft) <= 0) {
+      alert("Please enter your remaining fuel distance.");
       return;
     }
 
@@ -646,7 +666,7 @@ function App() {
         return;
       }
 
-      setLoadingText("Calculating true savings...");
+      setLoadingText("Checking reachable stations...");
       const analyzedStations = await analyzeStationsWithRealDetour(rawStations);
       setStations(analyzedStations);
 
@@ -660,7 +680,7 @@ function App() {
           );
         }, 300);
       } else {
-        alert("No gas stations found for this route.");
+        alert("No reachable gas stations found with your current fuel range.");
       }
     } catch (err) {
       console.error("Analyze failed:", err);
@@ -688,6 +708,8 @@ function App() {
         return;
       }
 
+      const averagePrice = getAverageKnownPrice(rawStations);
+
       const analyzedStations = rawStations
         .map((station) => {
           const distanceMiles = getDistanceMiles(userLocation, {
@@ -696,10 +718,12 @@ function App() {
           });
 
           const estimatedDriveMinutes = (distanceMiles / 30) * 60;
+          const canReachStation = distanceMiles <= Number(fuelDistanceLeft);
 
-          const priceSavings = station.price
-            ? Math.max(0, currentPrice - station.price) * gallonsNeeded
-            : 0;
+          const priceSavings =
+            station.price && averagePrice
+              ? Math.max(0, averagePrice - station.price) * gallonsNeeded
+              : 0;
 
           const extraFuelCost = station.price
             ? (distanceMiles / mpg) * station.price
@@ -710,6 +734,7 @@ function App() {
 
           return {
             ...station,
+            averagePrice,
             distanceFromRoute: distanceMiles,
             extraMinutes: estimatedDriveMinutes,
             extraDistance: distanceMiles,
@@ -717,11 +742,11 @@ function App() {
             extraFuelCost,
             timeCost,
             netSavings,
-            canReachStation: true,
+            canReachStation,
             milesToStation: distanceMiles,
-            smartLabel: "Nearby Option",
           };
         })
+        .filter((station) => station.canReachStation)
         .sort((a, b) => {
           if (b.netSavings !== a.netSavings) {
             return b.netSavings - a.netSavings;
@@ -732,18 +757,12 @@ function App() {
         .slice(0, 10)
         .map((station, index) => ({
           ...station,
-          smartLabel:
-            index === 0
-              ? "Best Nearby"
-              : station.extraMinutes <= 5
-              ? "Close Pick"
-              : "Nearby Option",
         }));
 
       setStations(analyzedStations);
 
       if (!analyzedStations.length) {
-        alert("No nearby stations found.");
+        alert("No reachable nearby stations found with your current fuel range.");
       }
     } catch (err) {
       console.error("Nearby search failed:", err);
@@ -842,7 +861,7 @@ function App() {
                     setDestinationResults([]);
                     setSelectedDestinationPlace(null);
                   }}
-                  placeholder="Destination, ex: sam's club"
+                  placeholder="Destination, ex: Sam's Club"
                 />
 
                 <button onClick={searchDestinationPlaces}>Search</button>
@@ -923,8 +942,8 @@ function App() {
                 options={{
                   suppressMarkers: false,
                   polylineOptions: {
-                    strokeColor: "#94a3b8",
-                    strokeOpacity: 0.45,
+                    strokeColor: "#3B82F6",
+                    strokeOpacity: 0.55,
                     strokeWeight: 6,
                   },
                 }}
@@ -937,7 +956,7 @@ function App() {
                 options={{
                   suppressMarkers: false,
                   polylineOptions: {
-                    strokeColor: "#38bdf8",
+                    strokeColor: "#22C55E",
                     strokeOpacity: 0.95,
                     strokeWeight: 7,
                   },
@@ -970,8 +989,8 @@ function App() {
           >
             {mode === "route" ? (
               <>
-                <span>Gray = original route</span>
-                <span>Blue = optimized fuel route</span>
+                <span>Blue = original route</span>
+                <span>Green = optimized fuel route</span>
               </>
             ) : (
               <span>Nearby results from your current location</span>
@@ -983,11 +1002,12 @@ function App() {
           <section className="card">
             <h2>Savings Inputs</h2>
 
-            <label>Current nearby gas price</label>
+            <label>Fuel distance left</label>
             <input
               type="number"
-              value={currentPrice}
-              onChange={(e) => setCurrentPrice(Number(e.target.value))}
+              value={fuelDistanceLeft}
+              onChange={(e) => setFuelDistanceLeft(Number(e.target.value))}
+              placeholder="Ex: 120 miles"
             />
 
             <label>Gallons needed</label>
@@ -1012,13 +1032,12 @@ function App() {
 
         {bestStation && (
           <section className="best-card">
-            <p className="badge">{bestStation.smartLabel}</p>
             <h2>{bestStation.name}</h2>
             <p>{bestStation.address}</p>
 
             <div className="hero-savings">
               <strong>${bestStation.netSavings.toFixed(2)}</strong>
-              <span>Estimated Savings</span>
+              <span>Estimated Savings vs route average</span>
             </div>
 
             <div className="mini-stats">
@@ -1028,6 +1047,7 @@ function App() {
                   : "Price unavailable"}
               </p>
               <p>{bestStation.extraMinutes.toFixed(1)} min away</p>
+              <p>{bestStation.milesToStation.toFixed(1)} mi to station</p>
             </div>
 
             <button onClick={() => openGoogleMaps(bestStation)}>
@@ -1040,7 +1060,6 @@ function App() {
 
         {selectedStation && selectedStation.id !== bestStation?.id && (
           <section className="card">
-            <p className="badge">{selectedStation.smartLabel}</p>
             <h2>{selectedStation.name}</h2>
             <p>Net savings: ${selectedStation.netSavings.toFixed(2)}</p>
             <p>
